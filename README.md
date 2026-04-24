@@ -125,6 +125,7 @@ if not lock:
 ALTER TABLE analytics
 ADD COLUMN post_id VARCHAR(128) NULL,
 ADD COLUMN published_at DATETIME NULL;
+ADD CONSTRAINT uq_task_id UNIQUE (task_id);
 ```
 
 Poster виконує обидва записи в одній транзакції:
