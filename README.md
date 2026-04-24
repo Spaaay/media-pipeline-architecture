@@ -94,7 +94,7 @@ ADD COLUMN locked_at DATETIME NULL;
 ```sql
 SELECT * FROM tasks
 WHERE status = 'NEW'
-  AND (locked_at IS NULL OR locked_at < NOW() - INTERVAL 5 MINUTE)
+  AND (next_retry_at IS NULL OR next_retry_at <= UTC_TIMESTAMP())
 ORDER BY created_at ASC
 LIMIT 1
 FOR UPDATE SKIP LOCKED;
@@ -124,7 +124,7 @@ if not lock:
 ```sql
 ALTER TABLE analytics
 ADD COLUMN post_id VARCHAR(128) NULL,
-ADD COLUMN published_at DATETIME NULL;
+ADD COLUMN published_at DATETIME NULL,
 ADD CONSTRAINT uq_task_id UNIQUE (task_id);
 ```
 
