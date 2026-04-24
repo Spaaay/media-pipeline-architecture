@@ -33,7 +33,7 @@ Scraper перевіряє існування запису через `SELECT`, 
 
 ## Схема архітектури
 
-![Media Pipeline Schema](schema.png)
+![Media Pipeline Schema](media_pipeline_final_schema.png)
 
 ### Locking
 
