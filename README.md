@@ -1,4 +1,4 @@
-# Media Pipeline — Architecture & Problem Analysis
+# Media Pipeline: Architecture & Problem Analysis
 
 ## 1. Root Cause Analysis
 
@@ -195,3 +195,196 @@ Prometheus + Alertmanager. Алерти на:
 - **Poster** залишається single instance за рахунок distributed lock.
 - **БД** — додати read replicas для `SELECT` запитів, connection pooling.
 - **Watchdog** виноситься в окремий легкий сервіс.
+
+## 6. Приклади коду
+
+### Scraper — idempotent insert
+
+Замість `SELECT` + `INSERT` використовуємо один запит.
+При дублі — просто оновлюємо `updated_at`, задача не створюється повторно.
+
+```python
+def scrape_and_save(source_url: str, db):
+    db.execute("""
+        INSERT INTO tasks (source_url, status)
+        VALUES (%s, 'NEW')
+        ON DUPLICATE KEY UPDATE updated_at = NOW()
+    """, (source_url,))
+```
+
+---
+
+### Downloader — SKIP LOCKED + watchdog
+
+`SKIP LOCKED` дозволяє кільком workers брати різні задачі одночасно без блокування.
+Watchdog повертає прострочені задачі в чергу.
+
+```python
+def acquire_task(db, worker_id: str):
+    return db.execute_one("""
+        SELECT * FROM tasks
+        WHERE status = 'NEW'
+          AND (locked_at IS NULL OR locked_at < NOW() - INTERVAL 5 MINUTE)
+        ORDER BY created_at ASC
+        LIMIT 1
+        FOR UPDATE SKIP LOCKED
+    """)
+
+def watchdog(db):
+    db.execute("""
+        UPDATE tasks
+        SET status = 'NEW', locked_by = NULL, locked_at = NULL
+        WHERE status = 'DOWNLOADING'
+          AND locked_at < NOW() - INTERVAL 5 MINUTE
+    """)
+```
+
+---
+
+### Poster — Redis distributed lock
+
+Якщо два cron triggers запускаються одночасно — другий просто виходить.
+`nx=True` гарантує що lock може взяти тільки один процес.
+
+```python
+import redis
+
+r = redis.Redis()
+
+def run_poster():
+    lock = r.set('poster:lock', 1, nx=True, ex=120)
+    if not lock:
+        return  # вже запущений
+    try:
+        tasks = db.query("SELECT * FROM tasks WHERE status = 'RENDERED'")
+        for task in tasks:
+            publish_with_transaction(task)
+    finally:
+        r.delete('poster:lock')
+```
+
+---
+
+### Poster — атомарна транзакція
+
+`post_id` записується в `tasks` і `analytics` в одній транзакції.
+Якщо щось впало — обидва записи відкочуються разом.
+
+```python
+def publish_with_transaction(task, db):
+    post_id = external_api.publish(task)
+
+    with db.transaction():
+        db.execute("""
+            UPDATE tasks SET status = 'POSTED', post_id = %s
+            WHERE id = %s
+        """, (post_id, task['id']))
+
+        db.execute("""
+            INSERT INTO analytics (task_id, post_id, published_at)
+            VALUES (%s, %s, NOW())
+            ON DUPLICATE KEY UPDATE post_id = %s, published_at = NOW()
+        """, (task['id'], post_id, post_id))
+```
+
+---
+
+### Retry — exponential backoff + DLQ
+
+При помилці збільшуємо лічильник і відкладаємо наступну спробу.
+Після `max_retries` задача іде в Dead Letter Queue.
+
+```python
+from datetime import datetime, timedelta
+
+def handle_failure(task, error, db):
+    retry_count = task['retry_count'] + 1
+
+    if retry_count >= task['max_retries']:
+        with db.transaction():
+            db.execute("""
+                UPDATE tasks SET status = 'DEAD', error_message = %s
+                WHERE id = %s
+            """, (str(error), task['id']))
+
+            db.execute("""
+                INSERT INTO dead_letter_queue (task_id, last_error)
+                VALUES (%s, %s)
+            """, (task['id'], str(error)))
+    else:
+        delay = 30 * (4 ** (retry_count - 1))  # 30s, 120s, 480s
+        next_retry = datetime.utcnow() + timedelta(seconds=delay)
+
+        db.execute("""
+            UPDATE tasks
+            SET status = 'NEW',
+                retry_count = %s,
+                next_retry_at = %s,
+                error_message = %s
+            WHERE id = %s
+        """, (retry_count, next_retry, str(error), task['id']))
+```
+
+### Health Check — FastAPI ендпоінт
+
+Перевіряє стан всіх компонентів системи.
+Можна підключити до Prometheus або використовувати як liveness probe в Kubernetes.
+
+```python
+from fastapi import FastAPI
+from datetime import datetime
+
+app = FastAPI()
+
+@app.get("/health")
+async def health(db, redis):
+    checks = {}
+
+    # перевірка БД
+    try:
+        db.execute("SELECT 1")
+        checks['db'] = 'ok'
+    except Exception as e:
+        checks['db'] = f'fail: {e}'
+
+    # перевірка Redis
+    try:
+        redis.ping()
+        checks['redis'] = 'ok'
+    except Exception as e:
+        checks['redis'] = f'fail: {e}'
+
+    # задачі що залипли довше 10 хвилин
+    checks['stuck_jobs'] = db.scalar("""
+        SELECT COUNT(*) FROM tasks
+        WHERE status IN ('DOWNLOADING', 'RENDERING', 'POSTING')
+          AND locked_at < NOW() - INTERVAL 10 MINUTE
+    """)
+
+    # розмір DLQ
+    checks['dlq_pending'] = db.scalar("""
+        SELECT COUNT(*) FROM dead_letter_queue
+        WHERE resolved = 0
+    """)
+
+    status = 'healthy' if checks['db'] == 'ok' and checks['redis'] == 'ok' else 'degraded'
+
+    return {
+        'status': status,
+        'timestamp': datetime.utcnow(),
+        **checks
+    }
+```
+
+Приклад відповіді:
+
+```json
+{
+  "status": "healthy",
+  "timestamp": "2024-01-15T10:30:00",
+  "db": "ok",
+  "redis": "ok",
+  "stuck_jobs": 0,
+  "dlq_pending": 0
+}
+```
