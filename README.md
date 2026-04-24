@@ -31,6 +31,10 @@ Scraper перевіряє існування запису через `SELECT`, 
 
 ## 2. Нова архітектура retry/locking/monitoring
 
+## Схема архітектури
+
+![Media Pipeline Schema](schema.png)
+
 ### Locking
 
 - **Scraper:** `INSERT IGNORE` або `ON DUPLICATE KEY UPDATE` замість `SELECT` + `INSERT`.
