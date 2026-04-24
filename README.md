@@ -224,10 +224,10 @@ def acquire_task(db, worker_id: str):
     return db.execute_one("""
         SELECT * FROM tasks
         WHERE status = 'NEW'
-          AND (locked_at IS NULL OR locked_at < NOW() - INTERVAL 5 MINUTE)
+          AND (next_retry_at IS NULL OR next_retry_at <= UTC_TIMESTAMP())
         ORDER BY created_at ASC
         LIMIT 1
-        FOR UPDATE SKIP LOCKED
+        FOR UPDATE SKIP LOCKED;
     """)
 
 def watchdog(db):
@@ -248,11 +248,13 @@ def watchdog(db):
 
 ```python
 import redis
+import uuid
 
 r = redis.Redis()
 
 def run_poster():
-    lock = r.set('poster:lock', 1, nx=True, ex=120)
+    process_uuid = str(uuid.uuid4())
+    lock = r.set('poster:lock', process_uuid, nx=True, ex=120)
     if not lock:
         return  # вже запущений
     try:
@@ -260,7 +262,8 @@ def run_poster():
         for task in tasks:
             publish_with_transaction(task)
     finally:
-        r.delete('poster:lock')
+        if r.get('poster:lock') == process_uuid.encode():
+            r.delete('poster:lock')
 ```
 
 ---
